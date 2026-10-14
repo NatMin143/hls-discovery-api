@@ -154,6 +154,43 @@ async function anyVideoPlaying(page) {
   return false;
 }
 
+const areaClicks = new Map();
+
+// Real mouse click on the centre of each video / iframe (max 2 clicks each, while nothing is playing).
+// Many players only start (or load their source) after a click on the frame itself.
+async function clickPlayerAreas(page) {
+  const targets = [];
+  for (const frame of page.frames()) {
+    let handles = [];
+    try {
+      handles = await frame.locator('video, iframe').elementHandles();
+    } catch {
+      continue;
+    }
+    for (let i = 0; i < handles.length; i++) {
+      const h = handles[i];
+      try {
+        const tag = (await h.evaluate((n) => n.tagName)).toLowerCase();
+        await h.scrollIntoViewIfNeeded({ timeout: 500 });
+        const box = await h.boundingBox();
+        if (!box || box.width < 150 || box.height < 100) continue;
+        targets.push({ key: `${frame.url()}#${tag}#${i}`, tag, box, area: box.width * box.height });
+      } catch {}
+    }
+  }
+  targets.sort((a, b) => (a.tag === b.tag ? b.area - a.area : a.tag === 'video' ? -1 : 1));
+  for (const t of targets) {
+    const n = areaClicks.get(t.key) || 0;
+    if (n >= 2) continue;
+    areaClicks.set(t.key, n + 1);
+    try {
+      await page.mouse.click(t.box.x + t.box.width / 2, t.box.y + t.box.height / 2);
+    } catch {}
+    await sleep(1500);
+    if (await anyVideoPlaying(page)) return;
+  }
+}
+
 async function tryStartPlayback(page, clicked) {
   for (const frame of page.frames()) {
     try {
@@ -181,6 +218,8 @@ async function tryStartPlayback(page, clicked) {
       } catch {}
     }
   }
+  if (await anyVideoPlaying(page)) return;
+  await clickPlayerAreas(page);
 }
 
 async function collectPageDebug(page) {
@@ -494,6 +533,12 @@ async function main() {
 
     context.on('page', (p) => {
       pageCount++;
+      if (pageCount > 1) {
+        // popup/new tab (often an ad opened by a click): close it, keep listening on the main page
+        debug.popupsClosed = (debug.popupsClosed || 0) + 1;
+        p.close().catch(() => {});
+        return;
+      }
       p.on('console', (m) => {
         if (m.type() === 'error' && debug.consoleErrors.length < 20) debug.consoleErrors.push(m.text().slice(0, 300));
       });
