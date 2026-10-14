@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HLS Network Inspector</title>
+<style>
+:root{--bg:#fff;--fg:#111;--muted:#666;--card:#f3f3f6;--border:#d6d6dd;--accent:#2563eb;--ok:#15803d;--warn:#b45309;--bad:#b91c1c}
+@media (prefers-color-scheme:dark){:root{--bg:#111214;--fg:#eee;--muted:#9a9aa2;--card:#1c1d21;--border:#2e2f35;--accent:#6b9bff;--ok:#4ade80;--warn:#fbbf24;--bad:#f87171}}
+*{box-sizing:border-box}
+body{margin:0 auto;padding:16px;max-width:720px;background:var(--bg);color:var(--fg);font:16px/1.45 system-ui,-apple-system,sans-serif}
+h1{font-size:1.25rem;margin:0 0 4px}
+p.sub{color:var(--muted);margin:0 0 16px;font-size:.9rem}
+label{display:block;font-size:.85rem;color:var(--muted);margin:12px 0 4px}
+input{width:100%;padding:12px;font-size:16px;border:1px solid var(--border);border-radius:8px;background:var(--card);color:var(--fg)}
+button{padding:12px 16px;font-size:16px;border:0;border-radius:8px;background:var(--accent);color:#fff;font-weight:600}
+button.secondary{background:var(--card);color:var(--fg);border:1px solid var(--border)}
+button:disabled{opacity:.5}
+#go{width:100%;margin-top:16px}
+#status{margin:16px 0 8px;font-weight:600}
+.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}
+.card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px;margin:10px 0}
+.meta{font-size:.8rem;color:var(--muted);margin-bottom:6px}
+code{display:block;word-break:break-all;font:13px/1.4 ui-monospace,monospace;padding:8px;border-radius:6px;background:var(--bg);border:1px solid var(--border);user-select:all;-webkit-user-select:all}
+.card button{margin-top:8px;width:100%}
+ul{padding-left:20px}
+li{margin:6px 0;font-size:.9rem}
+.small{font-size:.8rem;color:var(--muted)}
+</style>
+</head>
+<body>
+<h1>HLS Network Inspector</h1>
+<p class="sub">Finds .m3u8 playlist URLs requested by a video page. Only use on sites you own or are authorized to test.</p>
+
+<label for="url">Video page URL</label>
+<input id="url" type="url" inputmode="url" autocapitalize="off" autocorrect="off" placeholder="https://your-site.example/watch/123">
+
+<label for="wait">Max wait after page load (seconds, 5-60)</label>
+<input id="wait" type="number" inputmode="numeric" min="5" max="60" value="20">
+
+<label for="token">Access token</label>
+<input id="token" type="password" autocomplete="current-password" placeholder="AUTH_TOKEN from Railway">
+
+<button id="go">Find playlist</button>
+<div id="status" role="status"></div>
+<div id="results"></div>
+
+<script>
+var $ = function (id) { return document.getElementById(id); };
+var lastResult = null;
+
+try { $('token').value = localStorage.getItem('hls_token') || ''; } catch (e) {}
+
+function setStatus(text, cls) {
+  var s = $('status');
+  s.textContent = text;
+  s.className = cls || '';
+}
+
+function el(tag, cls, text) {
+  var n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined) n.textContent = text;
+  return n;
+}
+
+function selectText(node) {
+  var r = document.createRange();
+  r.selectNodeContents(node);
+  var sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(r);
+}
+
+function render(data) {
+  lastResult = data;
+  var box = $('results');
+  box.textContent = '';
+
+  if (data.verifiedCount > 0) {
+    setStatus('Found ' + data.verifiedCount + ' verified playlist(s)', 'ok');
+  } else if (data.playlists.length > 0) {
+    setStatus('m3u8 request seen, but no valid playlist response', 'warn');
+  } else {
+    setStatus('No .m3u8 playlist detected', 'bad');
+  }
+
+  data.playlists.forEach(function (p, i) {
+    var card = el('div', 'card');
+    var type = p.playlistType !== 'unknown' ? p.playlistType.toUpperCase() : 'PLAYLIST';
+    var st = p.status ? 'HTTP ' + p.status : (p.failure ? 'FAILED: ' + p.failure : 'no response');
+    card.appendChild(el('div', 'meta', '#' + (i + 1) + ' \u2022 ' + type + ' \u2022 ' + st + ' \u2022 ' +
+      (p.verified ? 'verified' : 'UNVERIFIED') + ' \u2022 seen ' + p.count + 'x'));
+    var code = el('code', '', p.url);
+    card.appendChild(code);
+    if (p.redirectedFrom && p.redirectedFrom.length) {
+      card.appendChild(el('div', 'small', 'Redirected from: ' + p.redirectedFrom.join(' \u2192 ')));
+    }
+    var btn = el('button', '', 'Copy URL');
+    btn.onclick = function () {
+      var done = function (msg) {
+        btn.textContent = msg;
+        setTimeout(function () { btn.textContent = 'Copy URL'; }, 2000);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(p.url).then(function () { done('Copied \u2713'); }, function () {
+          selectText(code); done('Selected \u2014 long-press to copy');
+        });
+      } else { selectText(code); done('Selected \u2014 long-press to copy'); }
+    };
+    card.appendChild(btn);
+    box.appendChild(card);
+  });
+
+  if (data.verifiedCount === 0) {
+    var dbg = el('div', 'card');
+    dbg.appendChild(el('div', 'meta', 'Debug'));
+    var nav = data.navigation || {};
+    dbg.appendChild(el('div', 'small', 'Navigation: ' + (nav.ok ? 'ok (HTTP ' + nav.status + ')' : 'FAILED: ' + nav.error)));
+    dbg.appendChild(el('div', 'small', 'Video elements: ' + ((data.page && data.page.videos.length) || 0) +
+      ' \u2022 Frames: ' + ((data.page && data.page.frames.length) || 0)));
+    if (data.diagnosis && data.diagnosis.length) {
+      var ul = el('ul');
+      data.diagnosis.forEach(function (d) { ul.appendChild(el('li', '', d)); });
+      dbg.appendChild(ul);
+    }
+    box.appendChild(dbg);
+  }
+
+  var dl = el('button', 'secondary', 'Download full JSON');
+  dl.style.width = '100%';
+  dl.onclick = function () {
+    var blob = new Blob([JSON.stringify(lastResult, null, 2)], { type: 'application/json' });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'results.json';
+    a.click();
+  };
+  box.appendChild(dl);
+}
+
+$('go').onclick = function () {
+  var url = $('url').value.trim();
+  var token = $('token').value.trim();
+  var wait = Number($('wait').value) || 20;
+  if (!url || !token) { setStatus('Enter a URL and your access token.', 'bad'); return; }
+  try { localStorage.setItem('hls_token', token); } catch (e) {}
+
+  $('go').disabled = true;
+  $('results').textContent = '';
+  setStatus('Running\u2026 up to ' + (wait + 40) + 's. Keep this tab open.');
+
+  fetch('/api/inspect', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'authorization': 'Bearer ' + token },
+    body: JSON.stringify({ url: url, wait: wait })
+  }).then(function (r) {
+    return r.json().catch(function () { return { error: 'Bad response from server' }; }).then(function (data) {
+      if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+      render(data);
+    });
+  }).catch(function (e) {
+    setStatus(e.message, 'bad');
+  }).then(function () {
+    $('go').disabled = false;
+  });
+};
+</script>
+</body>
+</html>

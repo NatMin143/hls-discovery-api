@@ -1,135 +1,191 @@
+'use strict';
 
-import express from "express";
-import { chromium } from "playwright";
-import dns from "node:dns/promises";
-import net from "node:net";
+/**
+ * Minimal HTTP wrapper around inspector.js for Railway (or any host).
+ *   GET  /            -> mobile-friendly web UI
+ *   GET  /health      -> health check
+ *   POST /api/inspect -> { "url": "...", "wait": 20 }  (Authorization: Bearer <AUTH_TOKEN>)
+ *
+ * Env vars:
+ *   AUTH_TOKEN       required, 16+ chars
+ *   ALLOWED_HOSTS    optional, comma-separated domains (strongly recommended), e.g. "example.com,cdn.example.com"
+ *   MAX_CONCURRENT   optional, default 1
+ *   PORT             set automatically by Railway
+ *
+ * Use only against sites you own or are authorized to test.
+ */
 
-const app = express();
-const PORT = process.env.PORT || 3000;
+const http = require('node:http');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const net = require('node:net');
+const dns = require('node:dns').promises;
+const crypto = require('node:crypto');
+const { execFile } = require('node:child_process');
 
-const allowedHosts = (process.env.ALLOWED_HOSTS || "")
-  .split(",")
-  .map(host => host.trim().toLowerCase())
+const PORT = Number(process.env.PORT) || 3000;
+const TOKEN = process.env.AUTH_TOKEN || '';
+const MAX_CONCURRENT = Math.max(1, Number(process.env.MAX_CONCURRENT) || 1);
+const ALLOWED_HOSTS = (process.env.ALLOWED_HOSTS || '')
+  .split(',')
+  .map((s) => s.trim().toLowerCase())
   .filter(Boolean);
 
-app.get("/health", (_req, res) => {
-  res.json({ success: true, status: "healthy" });
-});
+if (TOKEN.length < 16) {
+  console.error('Refusing to start: set the AUTH_TOKEN environment variable (at least 16 characters).');
+  process.exit(1);
+}
 
-function isPublicAddress(ip) {
+const INDEX_HTML = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sha = (s) => crypto.createHash('sha256').update(s).digest();
+
+function authorized(req) {
+  const m = /^Bearer\s+(.+)$/i.exec(req.headers.authorization || '');
+  return !!m && crypto.timingSafeEqual(sha(m[1].trim()), sha(TOKEN));
+}
+
+function isPrivateIp(ip) {
   if (net.isIPv4(ip)) {
-    const [a, b] = ip.split(".").map(Number);
-    return !(
-      a === 10 ||
-      a === 127 ||
-      a === 0 ||
+    const [a, b] = ip.split('.').map(Number);
+    return (
+      a === 0 || a === 10 || a === 127 || a >= 224 ||
       (a === 169 && b === 254) ||
       (a === 172 && b >= 16 && b <= 31) ||
       (a === 192 && b === 168) ||
-      a >= 224
+      (a === 100 && b >= 64 && b <= 127)
     );
   }
-
   if (net.isIPv6(ip)) {
-    const value = ip.toLowerCase();
-    return value === "::1" ||
-      value === "::" ||
-      !(value.startsWith("fc") ||
-        value.startsWith("fd") ||
-        value.startsWith("fe8") ||
-        value.startsWith("fe9") ||
-        value.startsWith("fea") ||
-        value.startsWith("feb"));
+    const x = ip.toLowerCase();
+    if (x === '::1' || x === '::' || x.startsWith('fc') || x.startsWith('fd') || x.startsWith('fe80')) return true;
+    const m = x.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+    return m ? isPrivateIp(m[1]) : false;
   }
-
-  return false;
+  return true;
 }
 
-async function validateUrl(value) {
-  const url = new URL(value);
-
-  if (!["http:", "https:"].includes(url.protocol)) {
-    throw new Error("Only HTTP and HTTPS URLs are allowed.");
+async function validateTarget(raw) {
+  let u;
+  try {
+    u = new URL(raw);
+  } catch {
+    throw new Error('Invalid URL');
   }
-
-  if (url.username || url.password) {
-    throw new Error("URLs containing credentials are not allowed.");
+  if (!/^https?:$/.test(u.protocol)) throw new Error('Only http(s) URLs are allowed');
+  const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (ALLOWED_HOSTS.length && !ALLOWED_HOSTS.some((h) => host === h || host.endsWith('.' + h))) {
+    throw new Error('Host is not in ALLOWED_HOSTS');
   }
-
-  const host = url.hostname.toLowerCase();
-
-  if (!allowedHosts.includes(host)) {
-    throw new Error("This hostname is not allowlisted.");
+  if (host === 'localhost' || host.endsWith('.internal') || host.endsWith('.local')) {
+    throw new Error('Internal hostnames are blocked');
   }
-
-  const addresses = await dns.lookup(host, { all: true });
-
-  if (!addresses.length ||
-      addresses.some(item => !isPublicAddress(item.address))) {
-    throw new Error("The destination address is not permitted.");
+  let addrs;
+  try {
+    addrs = net.isIP(host) ? [{ address: host }] : await dns.lookup(host, { all: true });
+  } catch {
+    throw new Error('Could not resolve that hostname');
   }
-
-  return url;
+  if (addrs.some((a) => isPrivateIp(a.address))) throw new Error('Private/internal addresses are blocked');
+  return u.href;
 }
 
-app.get("/api/inspect", async (req, res) => {
-  let browser;
+let running = 0;
+
+function runInspector(url, wait) {
+  return new Promise((resolve, reject) => {
+    const out = path.join(os.tmpdir(), `hls-${crypto.randomUUID()}.json`);
+    const args = ['inspector.js', url, '--no-sandbox', '--wait', String(wait), '--timeout', '30', '--out', out];
+    execFile(
+      process.execPath,
+      args,
+      { cwd: __dirname, timeout: (wait + 60) * 1000, killSignal: 'SIGKILL', maxBuffer: 5 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        let result = null;
+        try {
+          result = JSON.parse(fs.readFileSync(out, 'utf8'));
+        } catch {}
+        fs.rm(out, { force: true }, () => {});
+        if (result) return resolve(result);
+        const msg = String(stderr || stdout || (err && err.message) || 'Inspector failed').trim();
+        reject(new Error(msg.slice(0, 500)));
+      }
+    );
+  });
+}
+
+function readJson(req, limit = 10 * 1024) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > limit) {
+        reject(new Error('Request body too large'));
+        req.destroy();
+      } else chunks.push(c);
+    });
+    req.on('end', () => {
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'));
+      } catch {
+        reject(new Error('Body must be valid JSON'));
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+const server = http.createServer(async (req, res) => {
+  const send = (code, body, type = 'application/json') => {
+    res.writeHead(code, {
+      'content-type': `${type}; charset=utf-8`,
+      'cache-control': 'no-store',
+      'x-content-type-options': 'nosniff',
+    });
+    res.end(type === 'application/json' ? JSON.stringify(body) : body);
+  };
 
   try {
-    if (typeof req.query.url !== "string") {
-      return res.status(400).json({
-        success: false,
-        error: "Provide a URL using ?url="
-      });
+    const { pathname } = new URL(req.url, 'http://localhost');
+
+    if (req.method === 'GET' && pathname === '/health') return send(200, { ok: true });
+    if (req.method === 'GET' && pathname === '/') return send(200, INDEX_HTML, 'text/html');
+
+    if (req.method === 'POST' && pathname === '/api/inspect') {
+      if (!authorized(req)) {
+        await sleep(500); // slow down token guessing
+        return send(401, { error: 'Unauthorized: wrong or missing token' });
+      }
+      const body = await readJson(req);
+      const wait = Math.min(Math.max(Number(body.wait) || 20, 5), 60);
+      let url;
+      try {
+        url = await validateTarget(String(body.url || ''));
+      } catch (err) {
+        return send(400, { error: err.message });
+      }
+      if (running >= MAX_CONCURRENT) return send(429, { error: 'Busy: another inspection is running. Try again shortly.' });
+
+      running++;
+      try {
+        const result = await runInspector(url, wait);
+        return send(200, result);
+      } catch (err) {
+        return send(500, { error: err.message });
+      } finally {
+        running--;
+      }
     }
 
-    const target = await validateUrl(req.query.url);
-    const playlists = new Set();
-
-    browser = await chromium.launch({ headless: true });
-    const context = await browser.newContext();
-    const page = await context.newPage();
-
-    page.on("request", request => {
-      try {
-        const url = new URL(request.url());
-
-        if (
-          url.protocol === "https:" &&
-          /\.m3u8$/i.test(url.pathname)
-        ) {
-          playlists.add(url.href);
-        }
-      } catch {}
-    });
-
-    await page.goto(target.href, {
-      waitUntil: "domcontentloaded",
-      timeout: 20000
-    });
-
-    await page.waitForTimeout(5000);
-
-    res.json({
-      success: true,
-      source: target.href,
-      count: playlists.size,
-      streams: [...playlists].map(url => ({
-        type: "hls",
-        url
-      })),
-      note: "Discovery does not guarantee playback."
-    });
-  } catch (error) {
-    res.status(400).json({
-      success: false,
-      error: error.message
-    });
-  } finally {
-    if (browser) await browser.close().catch(() => {});
+    send(404, { error: 'Not found' });
+  } catch (err) {
+    send(400, { error: err.message || 'Bad request' });
   }
 });
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`API listening on port ${PORT}`);
+server.requestTimeout = 0; // inspections can take a while
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`HLS inspector listening on :${PORT}` + (ALLOWED_HOSTS.length ? ` (allowed hosts: ${ALLOWED_HOSTS.join(', ')})` : ' (no ALLOWED_HOSTS set)'));
 });

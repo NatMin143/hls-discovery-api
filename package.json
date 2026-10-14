@@ -1,14 +1,15 @@
-
 {
-  "name": "hls-discovery-api",
-  "version": "1.0.0",
-  "private": true,
-  "type": "module",
+  "name": "hls-network-inspector",
+  "version": "1.1.0",
+  "description": "Discover .m3u8 playlist URLs requested by a video page, using Playwright network events.",
+  "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "inspect": "node inspector.js"
   },
+  "engines": { "node": ">=18.17" },
   "dependencies": {
-    "express": "^5.1.0",
-    "playwright": "^1.55.0"
-  }
+    "playwright": "^1.49.0"
+  },
+  "license": "MIT"
 }
